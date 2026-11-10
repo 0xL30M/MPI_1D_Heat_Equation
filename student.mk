@@ -6,4 +6,4 @@
 # LDFLAGS += -L/path/to/libraries
 # LDLIBS += -lmy_library
 # Command-line assignments take precedence, e.g. make CFLAGS="-O2 -Wall".
-CFLAGS += -O3 -march=native -mtune=native -funroll-loops -flto -fno-math-errno
+CFLAGS += -O3 -flto -march=sapphirerapids -mprefer-vector-width=512 -ffast-math -funroll-loops
