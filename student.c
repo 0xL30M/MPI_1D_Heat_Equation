@@ -29,26 +29,29 @@ int heat_eqn_solver_1d(double *heat_array, double *err, size_t num_pts){
 
     double dx = 1.0 / (num_pts + 1);
 
-    // Allocazione allineata per l'uso dei registri AVX-512
+    // Padding estremo: allineamento forzato al confine della cache line (8 double = 64 byte).
+    // Questo previene i Cache Line Split garantendo che c[8] e n[8] siano 64-byte aligned.
+    size_t stride = (local_n + 15) & ~7; // Arrotondamento al multiplo di 8 superiore
+    size_t alloc_size = 2 * (stride + 16) * sizeof(double);
+    
     double *buffer;
-    size_t alloc_size = 2 * (local_n + 2) * sizeof(double);
     if (posix_memalign((void**)&buffer, 64, alloc_size) != 0) return -1;
 
-    // Inizializzazione a 0
-    for(size_t i = 0; i < 2 * (local_n + 2); i++) {
+    for(size_t i = 0; i < 2 * (stride + 16); i++) {
         buffer[i] = 0.0;
     }
 
     double * restrict curr = buffer;
-    double * restrict next = buffer + (local_n + 2);
+    double * restrict next = buffer + stride + 16;
 
+    // offset + 8 per saltare la regione fantasma allargata usata per l'allineamento
     if (local_n > 0) {
         for (size_t i = 0; i < local_n; i++) {
-            curr[i + 1] = heat_array[offset + 1 + i];
+            curr[8 + i] = heat_array[offset + 1 + i];
         }
     }
 
-    // Ricerca dei vicini (Topological search anti-deadlock)
+    // Topological search anti-deadlock
     int left_neighbor = MPI_PROC_NULL;
     int right_neighbor = MPI_PROC_NULL;
 
@@ -61,35 +64,53 @@ int heat_eqn_solver_1d(double *heat_array, double *err, size_t num_pts){
         }
     }
 
+    // Inizializzazione MPI Persistent Communications con Double Buffering
+    MPI_Request reqs[2][4];
+    int req_counts[2] = {0, 0};
+
+    for (int step = 0; step < 2; step++) {
+        double *c = (step == 0) ? curr : next;
+        
+        if (left_neighbor != MPI_PROC_NULL) {
+            MPI_Recv_init(&c[7], 1, MPI_DOUBLE, left_neighbor, 1, MPI_COMM_WORLD, &reqs[step][req_counts[step]++]);
+            MPI_Send_init(&c[8], 1, MPI_DOUBLE, left_neighbor, 0, MPI_COMM_WORLD, &reqs[step][req_counts[step]++]);
+        }
+        if (right_neighbor != MPI_PROC_NULL) {
+            MPI_Recv_init(&c[8 + local_n], 1, MPI_DOUBLE, right_neighbor, 0, MPI_COMM_WORLD, &reqs[step][req_counts[step]++]);
+            MPI_Send_init(&c[8 + local_n - 1], 1, MPI_DOUBLE, right_neighbor, 1, MPI_COMM_WORLD, &reqs[step][req_counts[step]++]);
+        }
+    }
+
     double step_err = 0.0;
 
     // Loop Temporale Principale
     for (size_t i = 0; i < ITER; i++){
         if (local_n > 0) {
-            // Halo Exchange bloccante contiguo (perfetto per latenze bassissime < 1 byte)
-            MPI_Sendrecv(&curr[1], 1, MPI_DOUBLE, left_neighbor, 0,
-                         &curr[local_n + 1], 1, MPI_DOUBLE, right_neighbor, 0,
-                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
-            MPI_Sendrecv(&curr[local_n], 1, MPI_DOUBLE, right_neighbor, 1,
-                         &curr[0], 1, MPI_DOUBLE, left_neighbor, 1,
-                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            int step_idx = i & 1; // Equivalente a i % 2, ottimizzato a bitwise
+            
+            // Startall elimina la latenza di attraversamento dello stack rispetto a Sendrecv
+            if (req_counts[step_idx] > 0) {
+                MPI_Startall(req_counts[step_idx], reqs[step_idx]);
+                MPI_Waitall(req_counts[step_idx], reqs[step_idx], MPI_STATUSES_IGNORE);
+            }
 
             double iter_err = 0.0;
             
-            // Loop computazionale unico e linearizzato.
-            // Grazie alla matematica semplificata, richiede la metà delle operazioni CPU.
+            // Assunzione esplicita di allineamento per vettorializzazione AVX-512 perfetta senza peeled loops
+            double * restrict c = __builtin_assume_aligned(curr, 64);
+            double * restrict n = __builtin_assume_aligned(next, 64);
+            
             #pragma GCC ivdep
-            for (size_t j = 1; j <= local_n; j++){
-                double new_val = 0.5 * (curr[j-1] + curr[j+1]);
-                iter_err += fabs(new_val - curr[j]);
-                next[j] = new_val;
+            for (size_t j = 8; j < local_n + 8; j++){
+                double new_val = 0.5 * (c[j-1] + c[j+1]);
+                iter_err += fabs(new_val - c[j]);
+                n[j] = new_val;
             }
 
             step_err += iter_err;
         }
         
-        // Pointer Swap
+        // Zero-copy pointer swap
         double * restrict temp = curr;
         curr = next;
         next = temp;
@@ -117,11 +138,11 @@ int heat_eqn_solver_1d(double *heat_array, double *err, size_t num_pts){
         }
     }
 
-    MPI_Gatherv(&curr[1], (int)local_n, MPI_DOUBLE,
+    MPI_Gatherv(&curr[8], (int)local_n, MPI_DOUBLE,
                 heat_array, recvcounts, displs, MPI_DOUBLE,
                 0, MPI_COMM_WORLD);
 
-    // Riduzione finale dell'errore (moltiplicato per dx solo una volta)
+    // Riduzione finale globale per l'errore calcolato
     double local_err = step_err * dx; 
     double global_err = 0.0;
     MPI_Reduce(&local_err, &global_err, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
@@ -133,6 +154,13 @@ int heat_eqn_solver_1d(double *heat_array, double *err, size_t num_pts){
         
         free(recvcounts);
         free(displs);
+    }
+
+    // Disallocazione risorse MPI persistenti
+    for (int step = 0; step < 2; step++) {
+        for (int k = 0; k < req_counts[step]; k++) {
+            MPI_Request_free(&reqs[step][k]);
+        }
     }
 
     free(buffer);
